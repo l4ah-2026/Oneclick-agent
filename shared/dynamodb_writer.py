@@ -1,20 +1,13 @@
 """DynamoDB persistence for One-Click Agent analysis results.
 
-Writes the analysis row into a DynamoDB table with attributes:
-    User (PK), DateTime (SK), RecordId, ErrorMessage, ErrorCode,
-    RootCause (Map / JSON), CreatedAt
+Writes the five fields required by the 4/21 MOMs into a DynamoDB table:
+    User, DateTime, RecordId, ErrorMessage, RootCause
 
 Design goals:
 - Never raises to the caller. DynamoDB failures must not break the agent
   stream back to the end user.
 - Configurable via environment (``ONECLICK_TABLE_NAME``, ``AWS_REGION``)
   with safe defaults so it works as a standalone script.
-
-Schema notes:
-- DynamoDB is schemaless for non-key attributes, so adding ``ErrorCode``
-  and changing ``RootCause`` from String to Map requires no table-level
-  migration. Existing rows keep their old ``RootCause`` String value;
-  new rows write ``RootCause`` as a Map.
 """
 
 from __future__ import annotations
@@ -23,7 +16,8 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from decimal import Decimal
+from typing import Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -41,12 +35,23 @@ def _get_table(table_name: Optional[str] = None, region: Optional[str] = None):
     return resource.Table(name), name, region
 
 
+def _convert_floats(obj):
+    """Recursively convert float values to Decimal for DynamoDB."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _convert_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_floats(v) for v in obj]
+    return obj
+
+
 async def save_analysis_result(
     user: str,
     datetime_str: str,
     record_id: str,
     error_message: str,
-    root_cause: Any = None,
+    root_cause: str | dict,
     error_code: str = "",
     table_name: Optional[str] = None,
     region: Optional[str] = None,
@@ -58,11 +63,8 @@ async def save_analysis_result(
         datetime_str: Report trigger time (ISO 8601). Used as sort key.
         record_id: Salesforce Vlocity Error Log record ID (may be empty).
         error_message: Raw error message from the report (may be empty).
-        root_cause: Parsed root-cause analysis. Should be a JSON-serializable
-            object (typically a dict from the agent's structured JSON output).
-            Stored as a DynamoDB Map. ``None`` is normalized to ``{}``.
-        error_code: HTTP / business error code derived from Datadog logs or
-            the agent's JSON output. Stored as a String attribute.
+        root_cause: The root-cause analysis text produced by the agent.
+        error_code: The error code retrieved from Datadog or parsed result (e.g. "400").
         table_name: Override the table name (else env ``ONECLICK_TABLE_NAME``).
         region: Override the AWS region (else env ``AWS_REGION``).
 
@@ -75,23 +77,13 @@ async def save_analysis_result(
     user_val = (user or "").strip() or "UNKNOWN"
     dt_val = (datetime_str or "").strip() or datetime.now(timezone.utc).isoformat()
 
-    # Normalize root_cause to a dict-like Map for DynamoDB.
-    if root_cause is None:
-        root_cause_map: Any = {}
-    elif isinstance(root_cause, (dict, list)):
-        root_cause_map = root_cause
-    else:
-        # Fallback wrapper so we never lose data when the agent fails to
-        # produce parseable JSON.
-        root_cause_map = {"raw_text": str(root_cause)}
-
     item = {
         "User": user_val,
         "DateTime": dt_val,
         "RecordId": record_id or "",
         "ErrorMessage": error_message or "",
-        "ErrorCode": str(error_code or ""),
-        "RootCause": root_cause_map,
+        "RootCause": _convert_floats(root_cause) if root_cause else "",
+        "ErrorCode": error_code or "",
         "CreatedAt": datetime.now(timezone.utc).isoformat(),
     }
 
