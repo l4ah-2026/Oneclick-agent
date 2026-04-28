@@ -61,26 +61,22 @@ async def save_oneclick_artifacts(
     raw_data: Optional[Any] = None,
     session_log_data: Optional[Any] = None,
     analysis_results: Optional[Any] = None,
+    mulesoft_logs: Optional[Any] = None,
     bucket_name: Optional[str] = None,
     region: Optional[str] = None,
 ) -> dict:
-    """Persist the three per-RecordID JSON artifacts to S3 asynchronously.
+    """Persist the JSON artifacts to S3 asynchronously.
 
     Args:
-        record_id: Salesforce Vlocity Error Log record ID. May be empty —
-            in that case the prefix falls back to ``{user}_{datetime}``.
-        user: Agent LAN ID (used only for the fallback prefix).
-        datetime_str: Report trigger time, ISO 8601 (used only for fallback).
-        raw_data: Original One-Click report payload (any JSON-serializable).
-        session_log_data: Last 10-minute Datadog records for the LAN ID.
-        analysis_results: Bedrock analysis (parsed JSON dict preferred).
-        bucket_name: Override the bucket (else env ``ONECLICK_S3_BUCKET``).
-        region: Override the region (else env ``AWS_REGION``).
-
-    Returns:
-        ``{"success": True, "bucket": ..., "prefix": ..., "keys": [...]}``
-        on success, or ``{"success": False, "error": "..."}`` on failure.
-        Artifacts whose value is ``None`` are skipped.
+        record_id: Salesforce Vlocity Error Log record ID.
+        user: Agent LAN ID.
+        datetime_str: Report trigger time.
+        raw_data: Original One-Click report payload.
+        session_log_data: Last 10-minute Datadog records.
+        analysis_results: Bedrock analysis results.
+        mulesoft_logs: Mulesoft debug logs (Log 2).
+        bucket_name: Override the bucket.
+        region: Override the region.
     """
     bucket = bucket_name or os.environ.get("ONECLICK_S3_BUCKET", DEFAULT_BUCKET_NAME)
     region_used = region or os.environ.get("AWS_REGION", DEFAULT_REGION)
@@ -93,6 +89,8 @@ async def save_oneclick_artifacts(
         artifacts.append(("session_log_data.json", session_log_data))
     if analysis_results is not None:
         artifacts.append(("analysis_results.json", analysis_results))
+    if mulesoft_logs is not None:
+        artifacts.append(("mulesoft_logs.json", mulesoft_logs))
 
     if not artifacts:
         return {"success": True, "bucket": bucket, "prefix": prefix, "keys": []}

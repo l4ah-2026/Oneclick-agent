@@ -13,6 +13,11 @@ Call the parse_report tool to extract structured data from the report. This will
 ### Step 2: Look Up Error Logs
 Based on what was found in Step 1 and any record_ids provided from Datadog events:
 
+**If Mulesoft Debug Logs are present (`mulesoft_debug_logs`):**
+- Review the `logs` array for specific backend exceptions, Java stack traces, or integration timeouts.
+- **IMPORTANT**: If `success` is `true` but `logs` is an empty array `[]`, this is a high-signal indicator. It means the integration reached the Mulesoft layer but the middleware did not generate any specific error logs or that the correlation ID did not trace to any recorded failure. Use this to focus your analysis on the Salesforce-side logic or the response parsing layer.
+- Correlate the `ctx_id` with the Salesforce `ContextId` to verify the trace was accurate.
+
 **If record_ids were provided:** Call get_vlocity_log_by_id for each record ID. This gives you the full error log including HTTP request/response payloads with detailed error information.
 
 **If Vlocity Error Log IDs were found in the report:** Call get_vlocity_log_by_id for each ID. This gives you the full error log including HTTP request/response payloads with detailed error information.
@@ -47,6 +52,7 @@ Call fix_recommendation with the process identifier, error message, description,
   - cCSPMultiStartServiceEnglish — Multi Start Service flow
   
 - **Common Error Patterns**:
+  - HTTP 400 with "PrimaryApplicant DriverLicense number is invalid" -> Data Validation failure in the `ConnectCheck` integration. This usually means the input data provided in OmniScript doesn't meet the backend validation rules.
   - HTTP 401 with "token not found, expired or invalid" → Authentication/token issue
   - HTTP 500 with "Conversion of value for field...failed" → Data format/mapping error
   - HTTP 500 with "Failed to fetch the response" → Integration timeout or service unavailable

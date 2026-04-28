@@ -9,16 +9,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from datetime import datetime, timedelta
 from typing import Any, Optional
 import boto3
 from botocore.exceptions import ClientError
-
-# Ensure the directory containing main.py (and all bundled packages) is on sys.path
-_this_dir = os.path.dirname(os.path.abspath(__file__))
-if _this_dir not in sys.path:
-    sys.path.insert(0, _this_dir)
 
 from strands import Agent, tool
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
@@ -34,6 +28,7 @@ from tools.query_exception_logs import (
     get_exception_log_by_id as _get_exception_log,
     search_exception_logs as _search_exceptions,
 )
+from tools.query_mulesoft_logs import query_mulesoft_logs
 from shared.dynamodb_writer import save_analysis_result
 from shared.s3_writer import save_oneclick_artifacts
 
@@ -379,9 +374,6 @@ def get_or_create_agent() -> Agent:
 # Datadog fetch helper
 # ---------------------------------------------------------------------------
 
-# _DD_ERROR_CODES = [400, 401, 403, 404, 408, 413, 429, 500, 502, 503, 504]
-
-
 _DD_ERROR_CODES = [
     300, 301, 302, 303, 304, 305, 306, 307, 308,
     400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413, 414, 415, 416, 417, 418, 421, 422, 423, 424, 425, 426, 427, 428, 429, 431, 440, 444, 449, 450, 451, 460, 463, 494, 495, 496, 497, 498, 499,
@@ -567,17 +559,71 @@ def _extract_root_cause_json(text: str) -> Optional[dict]:
     return None
 
 
+def GetResponseFromJSon(value: dict) -> str:
+    """Extract ``error_code`` or ``code`` from data that appears after ``response:``."""
+    if not isinstance(value, dict):
+        return ""
+
+    text = json.dumps(value)
+    match = re.search(r"response\s*:\s*", text, re.IGNORECASE)
+    if not match:
+        return ""
+
+    trimmed_text = text[match.end():].strip()
+
+    # Handle escaped JSON payloads that can appear after serialization.
+    unescaped_text = (
+        trimmed_text
+        .replace('\\"', '"')
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+    )
+
+    response_json = _extract_root_cause_json(trimmed_text)
+    log.info("response_json trimmed text: %s", response_json)
+
+    if not response_json:
+        response_json = _extract_root_cause_json(unescaped_text)
+    if not response_json:
+        return ""
+
+    log.info("response_json unescaped text: %s", response_json)
+
+    error_code = response_json.get('error_code')
+    if error_code is not None and str(error_code).strip():
+        log.info("error_code: %s", error_code)
+        return str(error_code).strip()
+
+    code = response_json.get('code')
+    if code is not None and str(code).strip():
+        log.info("code: %s", code)
+        return str(code).strip()
+
+    return ""
+
+
 def _derive_error_code(datadog_logs: Optional[dict], root_cause_json: Optional[dict]) -> str:
-    """Pick a single error_code: first matched Datadog log, else JSON field."""
+    """Pick a single error code, preferring ``error_code`` then ``code``."""
     if datadog_logs and datadog_logs.get('success'):
         for entry in datadog_logs.get('error_logs') or []:
-            code = str(entry.get('error_code') or '').strip()
+            error_code = str(entry.get('error_code') or '').strip()
+            if error_code:
+                return error_code
+
+            code = str(entry.get('code') or '').strip()
             if code:
                 return code
+
     if root_cause_json:
-        code = root_cause_json.get('error_code')
+        error_code = root_cause_json.get('error_code')
+        if error_code is not None and str(error_code).strip():
+            return str(error_code).strip()
+
+        code = root_cause_json.get('code')
         if code is not None and str(code).strip():
             return str(code).strip()
+
     return ""
 
 
@@ -628,6 +674,8 @@ async def invoke(payload, context):
             lookback_minutes=primary_lookback,
         )
 
+    log.info("Raw data: %s", datadog_error_logs)
+
     # Always fetch the last-10-min session log for the LAN ID (separate
     # artifact). When the primary fetch was already 10 min, reuse it.
     session_log_data: Optional[dict] = None
@@ -642,6 +690,28 @@ async def invoke(payload, context):
                 lookback_minutes=10,
             )
 
+    log.info("Session log data: %s", session_log_data)
+
+    # Correlate Context ID for Mulesoft logs (Log 2)
+    mulesoft_logs: Optional[dict] = None
+    if datadog_error_logs and datadog_error_logs.get('success'):
+        for err_entry in datadog_error_logs.get('error_logs', []):
+            full_ctx_id = err_entry.get('context_id')
+            if full_ctx_id:
+                # Extract the UUID part (after the last colon) if present
+                # Example: "2026-04-27T17:06:40:8ee3825a..." -> "8ee3825a..."
+                ctx_id = full_ctx_id.split(':')[-1] if ':' in full_ctx_id else full_ctx_id
+                
+                log.info(f"Correlating Mulesoft logs with Pivot ID: {ctx_id} (from {full_ctx_id})")
+                
+                credentials = get_datadog_credentials()
+                mulesoft_logs = await query_mulesoft_logs(
+                    ctx_id=ctx_id,
+                    trigger_time=trigger_time,
+                    credentials=credentials
+                )
+                break
+
     agent = get_or_create_agent()
 
     prompt = payload.get("prompt", "")
@@ -650,6 +720,8 @@ async def invoke(payload, context):
         report_data = dict(body)
         if datadog_error_logs:
             report_data['datadog_error_logs'] = datadog_error_logs
+        if mulesoft_logs:
+            report_data['mulesoft_debug_logs'] = mulesoft_logs
 
         prompt = (
             "Analyze the following One-Click Report entry and provide a full "
@@ -669,9 +741,25 @@ async def invoke(payload, context):
     # back to the caller.
     root_cause_text = "".join(root_cause_buffer).strip()
     root_cause_json = _extract_root_cause_json(root_cause_text)
-    if root_cause_json is None and root_cause_text:
+    if root_cause_json is None:
         log.warning("Could not extract JSON root_cause from agent output; storing raw_text fallback")
-    error_code = _derive_error_code(datadog_error_logs, root_cause_json)
+
+    #error_code = _derive_error_code(datadog_error_logs, root_cause_json)
+    error_code = _extract_root_cause_json(error_message).get('code', '') if error_message else ''
+
+    log.info("Error Code: %s", error_code)
+    root_cause_for_dynamodb: dict[str, Any] = (
+        root_cause_json
+        if root_cause_json is not None
+        else ({"raw_text": root_cause_text} if root_cause_text else {})
+    )
+
+    # Attach Mulesoft Correlation info to DynamoDB RootCause
+    if mulesoft_logs and mulesoft_logs.get('success'):
+        root_cause_for_dynamodb['mulesoft_correlation'] = {
+            'ctx_id': mulesoft_logs.get('ctx_id'),
+            'log_count': len(mulesoft_logs.get('logs', []))
+        }
 
     # 1) DynamoDB
     try:
@@ -680,9 +768,9 @@ async def invoke(payload, context):
             datetime_str=trigger_time,
             record_id=record_id,
             error_message=error_message,
-            root_cause=root_cause_json if root_cause_json is not None
-                      else ({"raw_text": root_cause_text} if root_cause_text else {}),
+            root_cause=root_cause_for_dynamodb,
             error_code=error_code,
+            mulesoft_logs=mulesoft_logs,
         )
         if write_result.get("success"):
             log.info("Persisted analysis result to DynamoDB: %s", write_result.get("key"))
@@ -701,8 +789,9 @@ async def invoke(payload, context):
             record_id=record_id,
             user=user,
             datetime_str=trigger_time,
-            raw_data=body,
+            raw_data=datadog_error_logs,
             session_log_data=session_log_data,
+            mulesoft_logs=mulesoft_logs,
             analysis_results=analysis_payload,
         )
         if s3_result.get("success"):

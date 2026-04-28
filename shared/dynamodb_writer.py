@@ -13,11 +13,12 @@ Design goals:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -35,15 +36,40 @@ def _get_table(table_name: Optional[str] = None, region: Optional[str] = None):
     return resource.Table(name), name, region
 
 
-def _convert_floats(obj):
-    """Recursively convert float values to Decimal for DynamoDB."""
-    if isinstance(obj, float):
-        return Decimal(str(obj))
-    if isinstance(obj, dict):
-        return {k: _convert_floats(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_convert_floats(v) for v in obj]
-    return obj
+def _to_dynamodb_document(value: Any) -> Any:
+    """Recursively convert Python values to DynamoDB-safe document values."""
+    if isinstance(value, float):
+        # DynamoDB does not accept float; use Decimal for numeric fidelity.
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {str(k): _to_dynamodb_document(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_dynamodb_document(v) for v in value]
+    if isinstance(value, tuple):
+        return [_to_dynamodb_document(v) for v in value]
+    return value
+
+
+def _normalize_root_cause(root_cause: Any) -> dict[str, Any]:
+    """Normalize input into a JSON object for DynamoDB Map storage."""
+    if isinstance(root_cause, dict):
+        payload = root_cause
+    elif isinstance(root_cause, str):
+        text = root_cause.strip()
+        if not text:
+            payload = {}
+        else:
+            try:
+                parsed = json.loads(text)
+                payload = parsed if isinstance(parsed, dict) else {"raw_text": text}
+            except json.JSONDecodeError:
+                payload = {"raw_text": text}
+    elif root_cause is None:
+        payload = {}
+    else:
+        payload = {"raw_value": str(root_cause)}
+
+    return _to_dynamodb_document(payload)
 
 
 async def save_analysis_result(
@@ -51,8 +77,9 @@ async def save_analysis_result(
     datetime_str: str,
     record_id: str,
     error_message: str,
-    root_cause: str | dict,
-    error_code: str = "",
+    root_cause: Any,
+    error_code: str,
+    mulesoft_logs: Optional[dict] = None,
     table_name: Optional[str] = None,
     region: Optional[str] = None,
 ) -> dict:
@@ -63,29 +90,30 @@ async def save_analysis_result(
         datetime_str: Report trigger time (ISO 8601). Used as sort key.
         record_id: Salesforce Vlocity Error Log record ID (may be empty).
         error_message: Raw error message from the report (may be empty).
-        root_cause: The root-cause analysis text produced by the agent.
-        error_code: The error code retrieved from Datadog or parsed result (e.g. "400").
-        table_name: Override the table name (else env ``ONECLICK_TABLE_NAME``).
-        region: Override the AWS region (else env ``AWS_REGION``).
-
-    Returns:
-        ``{"success": True, "table": ..., "key": {...}}`` on success,
-        or ``{"success": False, "error": "..."}`` on failure.
+        root_cause: Root-cause JSON object (or JSON/raw text to normalize).
+        error_code: Error code classification (may be empty).
+        mulesoft_logs: Mulesoft debug logs (Log 2) to persist.
+        table_name: Override the table name.
+        region: Override the AWS region.
     """
     # Defensive: DynamoDB string attributes cannot be empty. Substitute a
     # placeholder so put_item never rejects the row.
     user_val = (user or "").strip() or "UNKNOWN"
     dt_val = (datetime_str or "").strip() or datetime.now(timezone.utc).isoformat()
+    root_cause_val = _normalize_root_cause(root_cause)
 
     item = {
         "User": user_val,
         "DateTime": dt_val,
         "RecordId": record_id or "",
         "ErrorMessage": error_message or "",
-        "RootCause": _convert_floats(root_cause) if root_cause else "",
+        "RootCause": root_cause_val,
         "ErrorCode": error_code or "",
         "CreatedAt": datetime.now(timezone.utc).isoformat(),
     }
+
+    if mulesoft_logs:
+        item["MulesoftLogs"] = _to_dynamodb_document(mulesoft_logs)
 
     try:
         loop = asyncio.get_event_loop()
