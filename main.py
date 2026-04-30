@@ -6,6 +6,7 @@ log lookups, and issue classification. Deployed on AgentCore Runtime.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -224,85 +225,110 @@ async def query_datadog_error_logs(record_id: str, user: str = "", trigger_time:
 
         all_matches = []
 
-        for code in error_codes:
-            query = (
-                "env_type:production "
-                "@data.payload.ChangeEventHeader.entityName:"
-                "vlocity_cmt__VlocityErrorLogEntry__c "
-                f"@data.payload.vlocity_cmt__ErrorCode__c:{code}"
-            )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tasks = []
+            for code in error_codes:
+                query = (
+                    "env_type:production "
+                    "@data.payload.ChangeEventHeader.entityName:"
+                    "vlocity_cmt__VlocityErrorLogEntry__c "
+                    f"@data.payload.vlocity_cmt__ErrorCode__c:{code}"
+                )
 
-            body = {
-                'filter': {
-                    'from': start_dt.isoformat(),
-                    'to': trigger_dt.isoformat(),
-                    'query': query,
-                },
-                'sort': 'timestamp',
-                'page': {'limit': 100},
-            }
+                body = {
+                    'filter': {
+                        'from': start_dt.isoformat(),
+                        'to': trigger_dt.isoformat(),
+                        'query': query,
+                    },
+                    'sort': 'timestamp',
+                    'page': {'limit': 100},
+                }
 
-            log.info(f"Querying Datadog for error code {code}, record_id={record_id}")
+                log.info(f"Queuing Datadog query for error code {code}, record_id={record_id}")
+                tasks.append(client.post(endpoint, headers=headers, json=body))
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(endpoint, headers=headers, json=body, timeout=30.0)
-                response.raise_for_status()
-                data = response.json()
-                events = data.get('data', [])
+            # Execute with basic retry/delay to avoid burst 429s
+            responses = []
+            chunk_size = 4
+            for i in range(0, len(tasks), chunk_size):
+                chunk = tasks[i:i + chunk_size]
+                chunk_responses = await asyncio.gather(*chunk, return_exceptions=True)
+                responses.extend(chunk_responses)
+                if i + chunk_size < len(tasks):
+                    await asyncio.sleep(0.5)  # Small gap between bursts
 
-            # Filter events by user (LanID) and record_id if provided
-            for event in events:
-                attrs = event.get('attributes', {}).get('attributes', {})
-                user_role = attrs.get('user_role', {})
-                user_alias = user_role.get('alias', '')
-
-                # Primary filter: Match by User (LanID) if provided
-                if user and user_alias != user:
+            for i, response in enumerate(responses):
+                code = error_codes[i]
+                if isinstance(response, Exception):
+                    log.error(f"Datadog query failed for code {code}: {response}")
                     continue
 
-                payload = attrs.get('data', {}).get('payload', {})
-                # Primary filter: Match by User (LanID) if provided
-                if user and user_alias != user:
+                if response.status_code == 429:
+                    log.warning(f"Datadog rate limit hit (429) for code {code}")
                     continue
 
-                http_response = payload.get('CCSP_HTTPResponse__c', '')
-                http_request = payload.get('CCSP_HTTPRequest__c', '')
-                user_profile = attrs.get('user_profile', {})
+                try:
+                    response.raise_for_status()
+                    data = response.json()
+                    events = data.get('data', [])
+                except Exception as e:
+                    log.error(f"Error parsing Datadog response for code {code}: {e}")
+                    continue
 
-                # Parse HTTP response JSON if possible
-                parsed_response = {}
-                if http_response:
-                    try:
-                        parsed_response = json.loads(http_response)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed_response = {'raw': http_response}
+                # Filter events by user (LanID) and record_id if provided
+                for event in events:
+                    attrs = event.get('attributes', {}).get('attributes', {})
+                    user_role = attrs.get('user_role', {})
+                    user_alias = user_role.get('alias', '')
 
-                all_matches.append({
-                    'record_id': record_id,
-                    'lan_id': user_alias,  # Added lan_id to match datadog_retrieve.py pattern
-                    'name': payload.get('Name', ''),
-                    'error_code': str(payload.get('vlocity_cmt__ErrorCode__c', '')),
-                    'functionality': payload.get('CCSP_Functionality__c', ''),
-                    'callout_status': payload.get('CCSP_CalloutStatus__c', ''),
-                    'log_number': payload.get('CCSP_LogNumber__c', ''),
-                    'object_name': payload.get('vlocity_cmt__ObjectName__c', ''),
-                    'os_type': payload.get('CCSP_OS_Type__c', ''),
-                    'status': payload.get('CCSP_Status__c', ''),
-                    'context_id': payload.get('vlocity_cmt__ContextId__c', ''),
-                    'source_name': payload.get('vlocity_cmt__SourceName__c', ''),
-                    'source_type': payload.get('vlocity_cmt__SourceType__c', ''),
-                    'request_sent_time': payload.get('CCSP_Request_Sent_Time__c', ''),
-                    'response_received_time': payload.get('CCSP_Response_Received_Time__c', ''),
-                    'created_date': payload.get('CreatedDate', ''),
-                    'http_request': http_request,
-                    'http_response': parsed_response,
-                    'record_type_id': payload.get('RecordTypeId', ''),
-                    'user_profile_name': user_profile.get('name', ''),
-                    'user_profile_type': user_profile.get('profile_name', ''),
-                    'user_alias': user_alias,
-                    'user_role_name': user_role.get('role_name', ''),
-                    'timestamp': event.get('attributes', {}).get('timestamp', ''),
-                })
+                    # Primary filter: Match by User (LanID) if provided
+                    if user and user_alias != user:
+                        continue
+
+                    payload = attrs.get('data', {}).get('payload', {})
+                    # Primary filter: Match by User (LanID) if provided
+                    if user and user_alias != user:
+                        continue
+
+                    http_response = payload.get('CCSP_HTTPResponse__c', '')
+                    http_request = payload.get('CCSP_HTTPRequest__c', '')
+                    user_profile = attrs.get('user_profile', {})
+
+                    # Parse HTTP response JSON if possible
+                    parsed_response = {}
+                    if http_response:
+                        try:
+                            parsed_response = json.loads(http_response)
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_response = {'raw': http_response}
+
+                    all_matches.append({
+                        'record_id': record_id,
+                        'lan_id': user_alias,  # Added lan_id to match datadog_retrieve.py pattern
+                        'name': payload.get('Name', ''),
+                        'error_code': str(payload.get('vlocity_cmt__ErrorCode__c', '')),
+                        'functionality': payload.get('CCSP_Functionality__c', ''),
+                        'callout_status': payload.get('CCSP_CalloutStatus__c', ''),
+                        'log_number': payload.get('CCSP_LogNumber__c', ''),
+                        'object_name': payload.get('vlocity_cmt__ObjectName__c', ''),
+                        'os_type': payload.get('CCSP_OS_Type__c', ''),
+                        'status': payload.get('CCSP_Status__c', ''),
+                        'context_id': payload.get('vlocity_cmt__ContextId__c', ''),
+                        'source_name': payload.get('vlocity_cmt__SourceName__c', ''),
+                        'source_type': payload.get('vlocity_cmt__SourceType__c', ''),
+                        'request_sent_time': payload.get('CCSP_Request_Sent_Time__c', ''),
+                        'response_received_time': payload.get('CCSP_Response_Received_Time__c', ''),
+                        'created_date': payload.get('CreatedDate', ''),
+                        'http_request': http_request,
+                        'http_response': parsed_response,
+                        'record_type_id': payload.get('RecordTypeId', ''),
+                        'user_profile_name': user_profile.get('name', ''),
+                        'user_profile_type': user_profile.get('profile_name', ''),
+                        'user_alias': user_alias,
+                        'user_role_name': user_role.get('role_name', ''),
+                        'timestamp': event.get('attributes', {}).get('timestamp', ''),
+                    })
 
         log.info(f"Found {len(all_matches)} matching error logs for user={user} record_id={record_id}")
 
@@ -409,69 +435,93 @@ async def _fetch_datadog_logs(
 
         matched_logs: list[dict] = []
 
-        for code in _DD_ERROR_CODES:
-            query = (
-                "env_type:production "
-                "@data.payload.ChangeEventHeader.entityName:"
-                "vlocity_cmt__VlocityErrorLogEntry__c "
-                f"@data.payload.vlocity_cmt__ErrorCode__c:{code}"
-            )
-            request_body = {
-                'filter': {
-                    'from': start_dt.isoformat(),
-                    'to': trigger_dt.isoformat(),
-                    'query': query,
-                },
-                'sort': 'timestamp',
-                'page': {'limit': 100},
-            }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            tasks = []
+            for code in _DD_ERROR_CODES:
+                query = (
+                    "env_type:production "
+                    "@data.payload.ChangeEventHeader.entityName:"
+                    "vlocity_cmt__VlocityErrorLogEntry__c "
+                    f"@data.payload.vlocity_cmt__ErrorCode__c:{code}"
+                )
+                request_body = {
+                    'filter': {
+                        'from': start_dt.isoformat(),
+                        'to': trigger_dt.isoformat(),
+                        'query': query,
+                    },
+                    'sort': 'timestamp',
+                    'page': {'limit': 100},
+                }
+                tasks.append(client.post(endpoint, headers=headers, json=request_body))
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(endpoint, headers=headers, json=request_body, timeout=30.0)
-                response.raise_for_status()
-                data = response.json()
-                events = data.get('data', [])
+            # Batch execution to avoid 429s (especially with the large _DD_ERROR_CODES list)
+            responses = []
+            chunk_size = 5
+            for i in range(0, len(tasks), chunk_size):
+                chunk = tasks[i:i + chunk_size]
+                chunk_responses = await asyncio.gather(*chunk, return_exceptions=True)
+                responses.extend(chunk_responses)
+                if i + chunk_size < len(tasks):
+                    await asyncio.sleep(0.4)
 
-            for event in events:
-                attrs = event.get('attributes', {}).get('attributes', {})
-                user_role = attrs.get('user_role', {})
-                user_alias = user_role.get('alias', '')
-
-                # Filter by LAN ID when provided.
-                if user and user_alias != user:
+            for i, response in enumerate(responses):
+                if isinstance(response, Exception):
+                    log.error(f"Helper fetch failed for code index {i}: {response}")
+                    continue
+                
+                if response.status_code == 429:
+                    log.warning(f"Helper fetch hit 429 for code index {i}")
                     continue
 
-                dd_payload = attrs.get('data', {}).get('payload', {})
+                try:
+                    response.raise_for_status()
+                    data = response.json()
+                    events = data.get('data', [])
+                except Exception as e:
+                    log.error(f"Helper parse failed for code index {i}: {e}")
+                    continue
 
-                http_response = dd_payload.get('CCSP_HTTPResponse__c', '')
-                parsed_response: Any = {}
-                if http_response:
-                    try:
-                        parsed_response = json.loads(http_response)
-                    except (json.JSONDecodeError, TypeError):
-                        parsed_response = {'raw': http_response}
+                for event in events:
+                    attrs = event.get('attributes', {}).get('attributes', {})
+                    user_role = attrs.get('user_role', {})
+                    user_alias = user_role.get('alias', '')
 
-                user_profile = attrs.get('user_profile', {})
+                    # Filter by LAN ID when provided.
+                    if user and user_alias != user:
+                        continue
 
-                matched_logs.append({
-                    'record_id': record_id,
-                    'lan_id': user_alias,
-                    'name': dd_payload.get('Name', ''),
-                    'error_code': str(dd_payload.get('vlocity_cmt__ErrorCode__c', '')),
-                    'functionality': dd_payload.get('CCSP_Functionality__c', ''),
-                    'callout_status': dd_payload.get('CCSP_CalloutStatus__c', ''),
-                    'log_number': dd_payload.get('CCSP_LogNumber__c', ''),
-                    'object_name': dd_payload.get('vlocity_cmt__ObjectName__c', ''),
-                    'status': dd_payload.get('CCSP_Status__c', ''),
-                    'context_id': dd_payload.get('vlocity_cmt__ContextId__c', ''),
-                    'created_date': dd_payload.get('CreatedDate', ''),
-                    'http_request': dd_payload.get('CCSP_HTTPRequest__c', ''),
-                    'http_response': parsed_response,
-                    'user_name': user_profile.get('name', ''),
-                    'user_alias': user_alias,
-                    'user_role_name': user_role.get('role_name', ''),
-                    'timestamp': event.get('attributes', {}).get('timestamp', ''),
-                })
+                    dd_payload = attrs.get('data', {}).get('payload', {})
+
+                    http_response = dd_payload.get('CCSP_HTTPResponse__c', '')
+                    parsed_response: Any = {}
+                    if http_response:
+                        try:
+                            parsed_response = json.loads(http_response)
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_response = {'raw': http_response}
+
+                    user_profile = attrs.get('user_profile', {})
+
+                    matched_logs.append({
+                        'record_id': record_id,
+                        'lan_id': user_alias,
+                        'name': dd_payload.get('Name', ''),
+                        'error_code': str(dd_payload.get('vlocity_cmt__ErrorCode__c', '')),
+                        'functionality': dd_payload.get('CCSP_Functionality__c', ''),
+                        'callout_status': dd_payload.get('CCSP_CalloutStatus__c', ''),
+                        'log_number': dd_payload.get('CCSP_LogNumber__c', ''),
+                        'object_name': dd_payload.get('vlocity_cmt__ObjectName__c', ''),
+                        'status': dd_payload.get('CCSP_Status__c', ''),
+                        'context_id': dd_payload.get('vlocity_cmt__ContextId__c', ''),
+                        'created_date': dd_payload.get('CreatedDate', ''),
+                        'http_request': dd_payload.get('CCSP_HTTPRequest__c', ''),
+                        'http_response': parsed_response,
+                        'user_name': user_profile.get('name', ''),
+                        'user_alias': user_alias,
+                        'user_role_name': user_role.get('role_name', ''),
+                        'timestamp': event.get('attributes', {}).get('timestamp', ''),
+                    })
 
         log.info(
             f"Datadog: {len(matched_logs)} logs for user={user} record_id={record_id} "
@@ -693,24 +743,45 @@ async def invoke(payload, context):
     log.info("Session log data: %s", session_log_data)
 
     # Correlate Context ID for Mulesoft logs (Log 2)
+    # Check both the primary fetch and the session log data for a Context ID
     mulesoft_logs: Optional[dict] = None
-    if datadog_error_logs and datadog_error_logs.get('success'):
-        for err_entry in datadog_error_logs.get('error_logs', []):
+    
+    # helper to find first context_id in a log set
+    def _find_ctx_id(data: Optional[dict]) -> Optional[str]:
+        if not data or not data.get('success'):
+            return None
+        for err_entry in data.get('error_logs', []):
             full_ctx_id = err_entry.get('context_id')
             if full_ctx_id:
                 # Extract the UUID part (after the last colon) if present
                 # Example: "2026-04-27T17:06:40:8ee3825a..." -> "8ee3825a..."
-                ctx_id = full_ctx_id.split(':')[-1] if ':' in full_ctx_id else full_ctx_id
-                
-                log.info(f"Correlating Mulesoft logs with Pivot ID: {ctx_id} (from {full_ctx_id})")
-                
-                credentials = get_datadog_credentials()
-                mulesoft_logs = await query_mulesoft_logs(
-                    ctx_id=ctx_id,
-                    trigger_time=trigger_time,
-                    credentials=credentials
-                )
-                break
+                return full_ctx_id.split(':')[-1] if ':' in full_ctx_id else full_ctx_id
+        return None
+
+    # try primary logs first, then fallback to session logs
+    ctx_id = _find_ctx_id(datadog_error_logs) or _find_ctx_id(session_log_data)
+
+    # Fallback: Extract from body['errormessage'] if logs didn't contain it
+    if not ctx_id and error_message:
+        # Match "CtxId:ID" or "ContextId: ID" or "ContextId:ID"
+        # Handles variations: CtxId:2026... or ContextId: 2026...
+        match = re.search(r'(?:CtxId|ContextId)\s*:\s*([^\s|]+)', error_message)
+        if match:
+            full_ctx_id = match.group(1)
+            ctx_id = full_ctx_id.split(':')[-1] if ':' in full_ctx_id else full_ctx_id
+            log.info(f"Extracted Pivot ID from errormessage: {ctx_id}")
+
+    if ctx_id:
+        log.info(f"Correlating Mulesoft logs with Pivot ID: {ctx_id}")
+        try:
+            credentials = get_datadog_credentials()
+            mulesoft_logs = await query_mulesoft_logs(
+                ctx_id=ctx_id,
+                trigger_time=trigger_time,
+                credentials=credentials
+            )
+        except Exception as e:
+            log.error(f"Failed to fetch Mulesoft logs: {e}")
 
     agent = get_or_create_agent()
 
